@@ -1,179 +1,154 @@
+"""
+Project Prism — Stage 5: FFmpeg / NVENC Hardware Video & Subtitle Mastering
+Copyright (c) 2026 Arhaan Sajeed Sayed. All rights reserved.
+"""
+
 import json
-import math
-import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 
-def format_srt_time(seconds: float) -> str:
-    hrs = int(seconds // 3600)
-    mins = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millis = int(round((seconds - math.floor(seconds)) * 1000))
-    return f"{hrs:02d}:{mins:02d}:{secs:02d},{millis:03d}"
-
-
-def build_srt_captions(slides: list[dict], srt_path: Path, pad_sec: float = 0.4) -> None:
-    """Generates an .srt subtitle file synced to each slide's audio runtime."""
-    entries = []
-    idx = 1
-    cursor = 0.0
-
-    for slide in slides:
-        dur = float(slide["duration_sec"])
-        text = re.sub(r"[*_#`~]", "", slide["narration_script"]).strip()
-        words = text.split()
-
-        if not words:
-            cursor += dur + pad_sec
-            continue
-
-        chunk_size = 11
-        chunks = [" ".join(words[i : i + chunk_size]) for i in range(0, len(words), chunk_size)]
-        total_chars = sum(len(c) for c in chunks)
-
-        chunk_start = cursor
-        for chunk in chunks:
-            weight = len(chunk) / max(total_chars, 1)
-            chunk_dur = dur * weight
-            chunk_end = chunk_start + chunk_dur
-
-            entries.append(
-                f"{idx}\n"
-                f"{format_srt_time(chunk_start)} --> {format_srt_time(chunk_end)}\n"
-                f"{chunk}\n"
-            )
-            idx += 1
-            chunk_start = chunk_end
-
-        cursor += dur + pad_sec
-
-    srt_path.write_text("\n".join(entries), encoding="utf-8")
-
-
-def detect_encoder(ffmpeg_bin: str) -> str:
-    """Tests if h264_nvenc actually initializes on this GPU/driver; falls back to libx264."""
-    test_cmd = [
-        ffmpeg_bin,
-        "-f", "lavfi",
-        "-i", "color=c=black:s=256x256:d=0.1",
-        "-c:v", "h264_nvenc",
-        "-f", "null",
-        "-",
-    ]
-    res = subprocess.run(test_cmd, capture_output=True)
-    return "h264_nvenc" if res.returncode == 0 else "libx264"
-
-
-def run_ffmpeg(cmd: list[str]) -> None:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"FFmpeg error:\n{proc.stderr[-1500:]}")
-
-
-def render_lecture(workspace_dir: str = "workspace", output_file: str = "final_lecture.mp4") -> None:
+def _find_ffmpeg() -> str:
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
-        raise RuntimeError("FFmpeg not found in PATH.")
+        raise FileNotFoundError("FFmpeg ('ffmpeg') not found in PATH. Install FFmpeg to master videos.")
+    return ffmpeg_bin
 
+
+def _can_encode_nvenc(ffmpeg_bin: str) -> bool:
+    """Runs a 1-frame probe encode to verify NVENC actually initializes on the GPU driver."""
+    probe_cmd = [
+        ffmpeg_bin, "-y",
+        "-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.1",
+        "-c:v", "h264_nvenc",
+        "-f", "null", "-",
+    ]
+    proc = subprocess.run(probe_cmd, capture_output=True, text=True)
+    return proc.returncode == 0
+
+
+def _format_srt_ts(seconds: float) -> str:
+    ms_total = max(0, int(round(seconds * 1000)))
+    hours, rem = divmod(ms_total, 3600000)
+    minutes, rem = divmod(rem, 60000)
+    secs, ms = divmod(rem, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+
+def compose_final_video(
+    workspace_dir: str = "workspace",
+    output_video: str = "lecture.mp4",
+) -> dict:
+    t0 = time.perf_counter()
     ws_path = Path(workspace_dir).resolve()
-    timeline_path = ws_path / "timeline.json"
-    slides = json.loads(timeline_path.read_text(encoding="utf-8"))
+    out_mp4 = Path(output_video).resolve()
+    out_mp4.parent.mkdir(parents=True, exist_ok=True)
 
-    encoder = detect_encoder(ffmpeg_bin)
-    print(f"Using video encoder: {encoder}")
+    ffmpeg_bin = _find_ffmpeg()
+    use_nvenc = _can_encode_nvenc(ffmpeg_bin)
+    v_codec_args = (
+        ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22", "-pix_fmt", "yuv420p"]
+        if use_nvenc
+        else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"]
+    )
+    encoder_name = "h264_nvenc" if use_nvenc else "libx264"
+    print(f"   [Video Mastering] Active encoder: {encoder_name}")
 
-    pad_sec = 0.4
-    temp_clips = []
+    slides = json.loads((ws_path / "timeline.json").read_text(encoding="utf-8"))
+    segment_files = []
+    srt_entries = []
+    srt_idx = 1
+    global_offset = 0.0
 
     for slide in slides:
         num = slide["slide_number"]
-        dur = float(slide["duration_sec"])
-        total_clip_dur = dur + pad_sec
-        fade_out_start = max(0.0, total_clip_dur - 0.35)
-
-        img_path = ws_path / slide["image_path"]
-        audio_path = ws_path / slide["audio_path"]
         anim_name = slide.get("animation_path")
-        anim_path = (ws_path / anim_name) if anim_name else None
-        clip_path = ws_path / f"clip_{num:02d}.mp4"
+        audio_name = slide.get("audio_path")
+        if not anim_name or not audio_name:
+            raise RuntimeError(f"Missing animation or audio artifact for Slide {num}.")
 
-        if anim_path and anim_path.exists():
-            print(f"[{num}/{len(slides)}] Compositing Manim animation for Slide {num}...")
-            vf = (
-                f"scale=1920:1080:force_original_aspect_ratio=decrease,"
-                f"pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=#0f172a,"
-                f"fps=30,tpad=stop_mode=clone:stop_duration=30,"
-                f"fade=t=in:st=0:d=0.35,fade=t=out:st={fade_out_start:.2f}:d=0.35"
-            )
-            input_args = ["-i", str(anim_path)]
-        else:
-            print(f"[{num}/{len(slides)}] Rendering Ken Burns motion slide for Slide {num}...")
-            frames = math.ceil(total_clip_dur * 30)
-            vf = (
-                f"scale=3840:2160,"
-                f"zoompan=z='min(zoom+0.0004,1.06)':d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=30,"
-                f"fade=t=in:st=0:d=0.35,fade=t=out:st={fade_out_start:.2f}:d=0.35"
-            )
-            # Single image input without -loop 1 since zoompan generates `frames` output frames
-            input_args = ["-i", str(img_path)]
+        anim_path = ws_path / anim_name
+        audio_path = ws_path / audio_name
+        seg_path = ws_path / f"seg_{num:02d}.mp4"
+
+        intro_sec = float(slide.get("anim_metrics", {}).get("board_intro_sec", 0.0))
+        audio_dur = float(slide.get("audio_duration_sec", 0.0))
+        total_seg_dur = round(intro_sec + audio_dur + 0.15, 3)
+        pad_dur = round(total_seg_dur + 2.0, 2)
+        delay_ms = int(round(intro_sec * 1000))
+
+        filter_complex = (
+            f"[0:v]tpad=stop_mode=clone:stop_duration={pad_dur},trim=duration={total_seg_dur},setpts=PTS-STARTPTS[v];"
+            f"[1:a]adelay={delay_ms}|{delay_ms},apad=whole_dur={total_seg_dur}[a]"
+        )
 
         cmd = [
-            ffmpeg_bin,
-            "-y",
-            *input_args,
+            ffmpeg_bin, "-y",
+            "-i", str(anim_path),
             "-i", str(audio_path),
-            "-vf", vf,
-            "-c:v", encoder,
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-af", f"apad=pad_dur={pad_sec}",
-            "-t", f"{total_clip_dur:.3f}",
-            str(clip_path),
+            "-filter_complex", filter_complex,
+            "-map", "[v]",
+            "-map", "[a]",
+            *v_codec_args,
+            "-r", "30",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            str(seg_path),
         ]
-        run_ffmpeg(cmd)
-        temp_clips.append(clip_path)
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"FFmpeg failed on Slide {num}:\n{proc.stderr[-1000:]}")
 
-    # 1. Concatenate segments into an intermediate raw video
-    concat_file = ws_path / "concat_list.txt"
-    concat_file.write_text("\n".join(f"file '{c.as_posix()}'" for c in temp_clips), encoding="utf-8")
-    raw_merged = ws_path / "raw_merged.mp4"
+        segment_files.append(seg_path)
 
-    run_ffmpeg([
-        ffmpeg_bin, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(raw_merged)
-    ])
+        for turn in slide.get("turn_timings", []):
+            start_abs = global_offset + intro_sec + float(turn["start_sec"])
+            end_abs = global_offset + intro_sec + float(turn["end_sec"])
+            speaker_tag = "Professor" if turn["speaker"] == "teacher" else "Student"
+            srt_entries.append(
+                f"{srt_idx}\n"
+                f"{_format_srt_ts(start_abs)} --> {_format_srt_ts(end_abs)}\n"
+                f"[{speaker_tag}] {turn['text']}\n"
+            )
+            srt_idx += 1
 
-    # 2. Generate and burn synced .srt subtitles into final_lecture.mp4
-    srt_local = Path("subtitles.srt")
-    build_srt_captions(slides, srt_local, pad_sec=pad_sec)
+        global_offset += total_seg_dur
+        print(f"[{num}/{len(slides)}] Mastered segment {seg_path.name} ({total_seg_dur:.2f}s via {encoder_name})")
 
-    out_path = Path(output_file).resolve()
-    print(f"Burning synced subtitles and encoding {out_path.name}...")
+    concat_list = ws_path / "concat_list.txt"
+    concat_list.write_text(
+        "\n".join(f"file '{seg.as_posix()}'" for seg in segment_files) + "\n",
+        encoding="utf-8",
+    )
 
-    sub_style = "FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H000F172A,BorderStyle=3,Outline=1,MarginV=32"
-    sub_cmd = [
-        ffmpeg_bin,
-        "-y",
-        "-i", str(raw_merged),
-        "-vf", f"subtitles={srt_local.name}:force_style='{sub_style}'",
-        "-c:v", encoder,
-        "-pix_fmt", "yuv420p",
-        "-c:a", "copy",
-        str(out_path),
-    ]
-    run_ffmpeg(sub_cmd)
+    concat_proc = subprocess.run(
+        [
+            ffmpeg_bin, "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-c", "copy",
+            str(out_mp4),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if concat_proc.returncode != 0:
+        raise RuntimeError(f"FFmpeg concat failed:\n{concat_proc.stderr[-1000:]}")
 
-    # Move subtitles.srt into workspace and clean temp clips
-    srt_local.replace(ws_path / "subtitles.srt")
-    for clip in temp_clips:
-        clip.unlink(missing_ok=True)
-    concat_file.unlink(missing_ok=True)
-    raw_merged.unlink(missing_ok=True)
+    srt_path = out_mp4.with_suffix(".srt")
+    srt_path.write_text("\n".join(srt_entries), encoding="utf-8")
 
-    print(f"Done. Final upgraded lecture saved to {out_path}")
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+    print(f"Done in {elapsed_ms} ms. Final video saved to {out_mp4} (Total: {global_offset:.2f}s)")
+    return {
+        "output_video": str(out_mp4),
+        "srt_subtitles": str(srt_path),
+        "total_duration_sec": round(global_offset, 2),
+        "encoder": encoder_name,
+        "compose_ms": elapsed_ms,
+    }
 
 
 if __name__ == "__main__":
-    render_lecture()
+    compose_final_video(workspace_dir="workspace_unit2", output_video="unit2_lecture.mp4")

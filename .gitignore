@@ -4,8 +4,16 @@ __pycache__/
 *.pyc
 models/
 workspace/
+workspace_arrays/
+workspace_v2_lecture/
+workspace_unit2/
+*.pptx
+*.ppt
+*.pdf
 *.mp4
 *.wav
 *.srt
+*.onnx
+*.bin
 .vscode/
 .env
